@@ -17,13 +17,7 @@ static unsigned active_machines;
 // Active and Inactive Machines
 set<MachineId_t> on_machines;
 set<MachineId_t> off_machines;
-map<CPUType_t, vector<VMType_t>> cpu_VM_Mapping = {
-        {ARM, {LINUX, LINUX_RT, WIN}},
-        {POWER, {LINUX, LINUX_RT, AIX}},
-        {RISCV, {LINUX, LINUX_RT}},
-        {X86, {LINUX, LINUX_RT, WIN}}
-    };
-map<MachineId_t, vector<VMType_t>> vms_On_Machine;
+vector<TaskId_t> total_task;
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -38,12 +32,12 @@ void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
     for (unsigned i = 0; i < Machine_GetTotal(); i++) {
         machines.push_back(MachineId_t(i));
-        Machine_SetState(MachineId_t(i), S5);
+        //Machine_SetState(MachineId_t(i), S0);
         //SimOutput("machine id: " + MachineId_t(i), 1);
-        off_machines.insert(MachineId_t(i));
+        SimOutput("machine p_state: " + to_string(Machine_GetInfo(MachineId_t(i)).p_state), 1);
+        on_machines.insert(MachineId_t(i));
     }
-    active_machines = 0;
-    SimOutput("bur?", 1);
+    active_machines = Machine_GetTotal();
     
     // for(unsigned i = 0; i < active_machines; i++)
     //     vms.push_back(VM_Create(LINUX, X86));
@@ -70,9 +64,23 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
 }
 
+//Method that checks vm, memory, cpu availability and gpu requirements
+bool CheckRequirements(MachineId_t machine_ID, TaskId_t task_id){
+    bool gpu_capable = IsTaskGPUCapable(task_id);
+    unsigned task_mem = GetTaskMemory(task_id);
+    VMType_t req_vm = RequiredVMType(task_id);
+    CPUType_t req_cpu_type = RequiredCPUType(task_id);
+    unsigned int mem_with_task = task_mem + Machine_GetInfo(machine_ID).memory_used;
+    unsigned int cores_with_task = 1 + Machine_GetInfo(machine_ID).active_tasks;
+    return mem_with_task <= Machine_GetInfo(machine_ID).memory_size 
+        && cores_with_task <= Machine_GetInfo(machine_ID).num_cpus && (Machine_GetInfo(machine_ID).gpus == gpu_capable || (Machine_GetInfo(machine_ID).gpus && !gpu_capable));
+}
+
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Get the task parameters
     SimOutput("NEW TASK INCOMING", 1);
+
+    total_task.push_back(task_id);
     bool gpu_capable = IsTaskGPUCapable(task_id);
     unsigned task_mem = GetTaskMemory(task_id);
     VMType_t req_vm = RequiredVMType(task_id);
@@ -80,132 +88,109 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     CPUType_t req_cpu_type = RequiredCPUType(task_id);
     // Decide to attach the task to an existing VM, 
     //if no machines are on or there none of the machines that are on are compatible 
-    if (on_machines.empty()){
-        //Iterate through list of off machines and then select associated CPU
-        for(const auto& machine_ID : off_machines){
-            ////SimOutput(to_string(machine_ID), 1);
-            //Check machines CPU type
-            SimOutput(to_string(machine_ID), 1);
-            if(Machine_GetCPUType(machine_ID) == req_cpu_type){
-                Machine_SetState(machine_ID, S0);
-                vms.push_back(VM_Create(req_vm, req_cpu_type)); //Doesnt save the VM_ID
-                VM_Attach(vms.back(), machines[machine_ID]); //worried about migration
-                VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
-                on_machines.insert(machine_ID);
-                vms_On_Machine.insert({machine_ID, {req_vm}}); // Adding the Req_VM to the unique Machine_ID
-                off_machines.erase(machine_ID);
-                active_machines++;
-                break;
+    // Loop through active VMs
+    for(auto &vm_id: vms){
+        if(VM_GetInfo(vm_id).vm_type == req_vm){
+            MachineId_t machine_id = VM_GetInfo(vm_id).machine_id;
+            if(Machine_GetInfo(machine_id).p_state != S5 && VM_GetInfo(vm_id).vm_type == req_vm && Machine_GetInfo(machine_id).cpu == req_cpu_type 
+                && CheckRequirements(machine_id, task_id)){
+                //Task finally can be put on a VM and machine with ALL requirements
+                SimOutput("In active VMs: Adding Task: " + to_string(task_id) + " to active machine: " + to_string(machine_id) 
+                     + " to existing VM: " + to_string(vm_id), 1);
+                SimOutput("Machine active tasks: " + to_string(Machine_GetInfo(machine_id).active_tasks), 1);
+                SimOutput("Machine state: " + to_string(Machine_GetInfo(machine_id).p_state), 1);
+                VM_AddTask(vm_id, task_id, LOW_PRIORITY);
+                return;
             }
         }
     }
-    // Now checking if active machines have the desired CPU and VM
-    else
-    {
-        for (const auto& machine_ID : on_machines){
-            //SimOutput("machine: " + machine_ID, 1);
-            //Filtering Based on Type of CPU
-            if(Machine_GetCPUType(machine_ID) == req_cpu_type){
-                //Filter Based on VMs
-                vector<VMType_t> active_vms = vms_On_Machine.at(machine_ID);
-                bool success = false;
-                for(const auto& vm : active_vms){
-                    // Found a VM
-                    if(vm == req_vm){
-                        //Now check memory
-                        unsigned mem_with_task = task_mem + Machine_GetInfo(machine_ID).memory_used;
-                        //If memory with the task is less than total memory
-                        if(mem_with_task <= Machine_GetInfo(machine_ID).memory_size){
-                            //Now filtering based on Cores
-                            unsigned cores_with_task = 1 + Machine_GetInfo(machine_ID).active_tasks;
-                            if(cores_with_task <= Machine_GetInfo(machine_ID).num_cpus){
-                                //Task finally can be put on the machine with ALL requirements
-                                VM_AddTask(vm, task_id, LOW_PRIORITY);
-                                success = true;
-                                //Breaks out of looping through VMs in an active machine
-                                break;
-                            }
-                        }
-                    }
-                } 
-                //Breaks out of looping through active machines
-                if(success){   
-                    break;
-                }
-                // No vm was successfully found, need to add a new one
-                // Check memory and available cores of active machines
-                unsigned mem_with_task = task_mem + Machine_GetInfo(machine_ID).memory_used;
-                //If memory with the task is less than total memory
-                if(mem_with_task <= Machine_GetInfo(machine_ID).memory_size){
-                    //Now filtering based on Cores
-                    unsigned cores_with_task = 1 + Machine_GetInfo(machine_ID).active_tasks;
-                    if(cores_with_task <= Machine_GetInfo(machine_ID).num_cpus){
-                        //Task finally can be put on an active machine with CPU, Mem, and Core requirements
-                        vms.push_back(VM_Create(req_vm, req_cpu_type)); //Doesnt save the VM_ID
-                        VM_Attach(vms.back(), machines[machine_ID]); //worried about migration
-                        VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
-                        on_machines.insert(machine_ID);
-                        off_machines.erase(machine_ID);
-                        success = true;
-                        // In the active machines found the requirements to add a VM and task so exit
-                        break;
-                    }
-                }
-                // vms.push_back(VM_Create(req_vm, req_cpu_type)); //Doesnt save the VM_ID
-                // VM_Attach(vms.back(), machines[machine_ID]); //worried about migration
-                // VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
-                // on_machines.insert(machine_ID);
-                // off_machines.erase(machine_ID);
-            }
+    // Haven't found active VM so loop through active machines that meet requirements
+    for(auto &machine_id : on_machines){
+        // Find machine that is active and compatible CPU and meets other requirements
+        if(Machine_GetInfo(machine_id).p_state != S5 && Machine_GetCPUType(machine_id) == req_cpu_type && CheckRequirements(machine_id, task_id)){
+            // Found Machine, Now create VM
+            SimOutput("In active Machines: Adding Task: " + to_string(task_id) + " to active machine: " + to_string(machine_id) 
+                        + " to new VM", 1);
+            SimOutput("Machine active tasks: " + to_string(Machine_GetInfo(machine_id).active_tasks), 1);
+            SimOutput("Machine state: " + to_string(Machine_GetInfo(machine_id).p_state), 1);
+            VMId_t vm = VM_Create(req_vm, req_cpu_type);
+            vms.push_back(vm); //Doesnt save the VM_ID
+            VM_Attach(vms.back(), machines[machine_id]); //worried about migration
+            VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
+            return;
         }
-        // No CPU was found in the ON machines so loop through OFF machines
-        for(const auto& machine_ID : off_machines){
-            //Check machines CPU type
-            if(Machine_GetCPUType(machine_ID) == req_cpu_type){
-                Machine_SetState(machine_ID, S0);
-                vms.push_back(VM_Create(req_vm, req_cpu_type)); //Doesnt save the VM_ID
-                VM_Attach(vms.back(), machines[machine_ID]); //worried about migration
-                VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
-                on_machines.insert(machine_ID);
-                vms_On_Machine.insert({machine_ID, {req_vm}}); // Adding the Req_VM to the unique Machine_ID
-                off_machines.erase(machine_ID);
-                active_machines++;
-                break;
-            }
-        }
+    }
+    // Didn't find active machines that meet requirements
+    // No CPU was found in the ON machines so loop through OFF machines
+    for (auto it = off_machines.begin(); it != off_machines.end(); ) {
+        int machine_id = *it;
+        if(Machine_GetCPUType(machine_id) == req_cpu_type && CheckRequirements(machine_id, task_id)){
+            // Found Machine, Now create VM
+            Machine_SetState(machine_id, S0); // Power up the machine
+            CPUPerformance_t current_p = Machine_GetInfo(machine_id).p_state;
         
-
+            on_machines.insert(machine_id); // Update machine to on
+            SimOutput("In off Machines: Adding Task: " + to_string(task_id) + " to off machine: " + to_string(machine_id)                             + " to new VM", 1);
+            SimOutput("Machine active tasks: " + to_string(Machine_GetInfo(machine_id).active_tasks), 1);
+            SimOutput("Machine state: " + to_string(Machine_GetInfo(machine_id).p_state), 1);
+            vms.push_back(VM_Create(req_vm, req_cpu_type)); //Doesnt save the VM_ID
+            //VM_AddTask(vms.back(), task_id, LOW_PRIORITY);
+            //it = off_machines.erase(it);
+            // Increment active machine count and exit loop
+            //active_machines++;
+            return;
+        } else {
+            ++it; // Move to the next machine
+            }
     }
-    
-    
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-    // Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    // if(migrating) {
-    //     VM_AddTask(vms[0], task_id, priority);
-    // }
-    // else {
-    //     VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    // }// Skeleton code, you need to change it according to your algorithm
 }
+
+
+
 
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
-
-
     //if number of tasks on a machine is 0, turn off machine
-    
+    // for (auto it = on_machines.begin(); it != on_machines.end(); ) {
+    //         int machine_id = *it;
+    //         if(Machine_GetInfo(machine_id).active_tasks == 0){
+    //             // off_machines.insert(machine_id);
+    //             // it = on_machines.erase(it);
+    //             Machine_SetState(machine_id, S5);
+    //             // Increment active machine count and exit loop
+    //             //active_machines--;
+    //         } else {
+    //             ++it; // Move to the next machine
+    //             }
+    //     }
+    // for(auto &machine_id : on_machines){
+    //     SimOutput("Machine: " + to_string(machine_id), 4);
+    //     unsigned num_tasks = Machine_GetInfo(machine_id).active_tasks;
+    //     if(num_tasks==0){
+    //         SimOutput("Machine State: " + to_string(Machine_GetInfo(machine_id).p_state), 4);
+    //         // for(auto &vm : vms){
+    //         //     if(VM_GetInfo(vm).machine_id == machine_id){
+    //         //         VM_Shutdown(vm);
+    //         //     }
+    //         // }   
+    //     }
+    // }
+    //  for(auto &vm : vms){
+    //     MachineId_t machine = VM_GetInfo(vm).machine_id;
+    //     unsigned num_tasks = VM_GetInfo(vm).active_tasks.size();
+    //     SimOutput("VM: " + to_string(vm), 4);
+    //     SimOutput("Machine: " + to_string(machine), 4);
+    //     SimOutput("Number of tasks: " + to_string(num_tasks), 4);
+    //     if(num_tasks!=0){
+    //         SimOutput("Machine State: " + to_string(Machine_GetInfo(machine).p_state), 4);
+    //         for(auto &task : VM_GetInfo(vm).active_tasks){
+    //                 SimOutput("TaskID: " + to_string(task) + ", remaing instr: " + to_string(GetTaskInfo(task).remaining_instructions), 4);
+    //         }
+    //     }
+    // }
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -265,8 +250,10 @@ void SchedulerCheck(Time_t time) {
     static unsigned counts = 0;
     counts++;
     if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
+         migrating = true;
+        //Going through active machines and seeing their active tasks
+         //ThrowException("Migrating, total tasks: ", total_task.size());
+         //VM_Migrate(1, 9);
     }
 }
 
@@ -288,6 +275,32 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
+     SimOutput("In StateChange , Time: " + to_string(time), 1);
     // Called in response to an earlier request to change the state of a machine
+    if(on_machines.size()==0 && off_machines.size()==0){
+    SimOutput("Init Machine " + to_string(machine_id) + " is now active.", 1);
+        if (Machine_GetInfo(machine_id).p_state == S0){
+            on_machines.insert(machine_id);
+            active_machines++;
+        }
+        if (Machine_GetInfo(machine_id).p_state == S5) {
+            off_machines.insert(machine_id);
+            SimOutput("Init Machine " + to_string(machine_id) + " is now inactive.", 1);
+        }
+    }else{
+    if (Machine_GetInfo(machine_id).p_state == S0) {
+        on_machines.insert(machine_id);
+        off_machines.erase(machine_id);
+        SimOutput("Machine " + to_string(machine_id) + " is now active.", 1);
+        active_machines++;
+
+    }
+    if (Machine_GetInfo(machine_id).p_state == S5) {
+        on_machines.erase(machine_id);
+        off_machines.insert(machine_id);
+        SimOutput("Machine " + to_string(machine_id) + " is now inactive.", 1);
+        active_machines--;
+    }
+    }
 }
 
